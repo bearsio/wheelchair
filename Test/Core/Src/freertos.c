@@ -43,13 +43,16 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define MAX_PITCH_ANGLE   20.0f
-#define MAX_YAW_ANGLE     20.0f
-#define MAX_SPEED         100.0f
+#define MAX_PITCH_ANGLE   25.0f
+#define MAX_YAW_ANGLE     30.0f
+#define MAX_SPEED         200.0f
 #define DEAD_ZONE_PITCH   3.0f
 #define DEAD_ZONE_YAW     3.0f
 #define SPEED_SMOOTHING   0.15f
-
+#define SENSOR_FILTER_ALPHA 0.1f
+#define MAX_DELTA_SPEED 10.0f
+#define MAX_PITCH_JUMP 10.0f   // pitch 跳变保护阈值
+#define MAX_YAW_JUMP   10,.0f   // yaw 跳变保护阈值
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -65,6 +68,27 @@ osThreadId SafetyHandle;
 /* USER CODE BEGIN FunctionPrototypes */
 QueueHandle_t uart_rx_queue;
 extern uint8_t  buff_data;
+volatile uint32_t last_frame_tick = 0;
+float last_left_speed = 0;
+float last_right_speed = 0;
+
+static float filtered_pitch = 0.0f;
+static float filtered_yaw = 0.0f;
+
+// 用于异常跳变保护
+static float last_raw_pitch = 0.0f;
+static float last_raw_yaw = 0.0f;
+
+// 添加一个复位函数
+void reset_state(void) {
+    last_left_speed = 0.0f;
+    last_right_speed = 0.0f;
+    filtered_pitch = 0.0f;
+    filtered_yaw = 0.0f;
+    last_raw_pitch = 0.0f;
+    last_raw_yaw = 0.0f;
+}
+
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void const * argument);
@@ -153,72 +177,76 @@ void StartDefaultTask(void const * argument)
   /* USER CODE BEGIN StartDefaultTask */
 	
 	
-	UartFrame_t frame1;
-	// 用于滤波缓存上一次速度值
-  float last_left_speed = 0;
-  float last_right_speed = 0;
-  
-	
-	/* Infinite loop */
-  for(;;)
-  {
+		UartFrame_t frame1;
 		
-		 if (xQueueReceive(uart_rx_queue, &frame1, portMAX_DELAY) == pdPASS) 
-			 {
-							
-					 float pitch = frame1.f1;
-					 float yaw = frame1.f2;
-					 
-					 //俯仰角控制前进后退速度
-					 
-					 float pitch_speed = 0.0f;
-					 if(fabsf(pitch)>DEAD_ZONE_PITCH)
-					 {
-							pitch_speed = (pitch/MAX_PITCH_ANGLE)*MAX_SPEED;
-						 //边界值
-						 if (pitch_speed >  MAX_SPEED) pitch_speed =  MAX_SPEED;
-						 if (pitch_speed < -MAX_SPEED) pitch_speed = -MAX_SPEED;
-					 }
-					 //偏航角控制左右差速
-					 
-					 float yaw_adjust = 0.0f;
-					if (fabsf(yaw) > DEAD_ZONE_YAW)
-					{
-						yaw_adjust = (yaw / MAX_YAW_ANGLE) * MAX_SPEED;
-						if (yaw_adjust >  MAX_SPEED) yaw_adjust =  MAX_SPEED;
-						if (yaw_adjust < -MAX_SPEED) yaw_adjust = -MAX_SPEED;
-					}
-						// ---------------- 差速合成 ----------------
-					float left_speed  = pitch_speed - yaw_adjust;
-					float right_speed = pitch_speed + yaw_adjust;
-				 
-					 // 限幅
-					if (left_speed >  MAX_SPEED) left_speed = MAX_SPEED;
-					if (left_speed < -MAX_SPEED) left_speed = -MAX_SPEED;
-					if (right_speed >  MAX_SPEED) right_speed = MAX_SPEED;
-					if (right_speed < -MAX_SPEED) right_speed = -MAX_SPEED;
 
-					// ---------------- 一阶滤波平滑 ----------------
-					left_speed  = SPEED_SMOOTHING * left_speed  + (1 - SPEED_SMOOTHING) * last_left_speed;
-					right_speed = SPEED_SMOOTHING * right_speed + (1 - SPEED_SMOOTHING) * last_right_speed;
-
-					last_left_speed  = left_speed;
-					last_right_speed = right_speed;
-
-						// ----- 输出PWM -----
-					set_left_pwm((int16_t)left_speed);
-					set_right_pwm((int16_t)right_speed);
-					
-					printf("Target L: %.1f, R: %.1f | Last L: %.1f, R: %.1f\r\n",
-							 left_speed, right_speed,
-							 last_left_speed, last_right_speed);
-						 
-			 }
-			 
-		}
 	
-  
-    osDelay(1);
+
+		for (;;)
+		{
+				if (xQueueReceive(uart_rx_queue, &frame1, pdMS_TO_TICKS(5)) == pdPASS)
+				{
+						float raw_pitch = frame1.f1;
+						float raw_yaw   = frame1.f2;
+						last_frame_tick = xTaskGetTickCount(); // 更新时间戳
+						// 异常跳变保护：pitch/yaw 跳变过大直接丢弃
+						if (fabsf(raw_pitch - last_raw_pitch) > MAX_PITCH_JUMP ||
+								fabsf(raw_yaw   - last_raw_yaw)   > MAX_YAW_JUMP)
+						{
+								printf("[WARN] Data jump too large: ΔPitch=%.1f, ΔYaw=%.1f → Discarded\r\n",
+											 raw_pitch - last_raw_pitch, raw_yaw - last_raw_yaw);
+								continue; // 丢弃此帧
+						}
+
+						// 更新上一帧原始数据
+						last_raw_pitch = raw_pitch;
+						last_raw_yaw   = raw_yaw;
+
+						// 传感器输入滤波
+						filtered_pitch = SENSOR_FILTER_ALPHA * raw_pitch + (1.0f - SENSOR_FILTER_ALPHA) * filtered_pitch;
+						filtered_yaw   = SENSOR_FILTER_ALPHA * raw_yaw   + (1.0f - SENSOR_FILTER_ALPHA) * filtered_yaw;
+
+						float pitch_speed = 0.0f;
+						if (fabsf(filtered_pitch) > DEAD_ZONE_PITCH)
+						{
+								pitch_speed = (filtered_pitch / MAX_PITCH_ANGLE) * MAX_SPEED;
+								pitch_speed = fminf(fmaxf(pitch_speed, -MAX_SPEED), MAX_SPEED);
+						}
+
+						float yaw_adjust = 0.0f;
+						if (fabsf(filtered_yaw) > DEAD_ZONE_YAW)
+						{
+								yaw_adjust = (filtered_yaw / MAX_YAW_ANGLE) * MAX_SPEED;
+								yaw_adjust = fminf(fmaxf(yaw_adjust, -MAX_SPEED), MAX_SPEED);
+						}
+
+						float target_left_speed  = pitch_speed - yaw_adjust;
+						float target_right_speed = pitch_speed + yaw_adjust;
+
+						float delta_l = target_left_speed - last_left_speed;
+						float delta_r = target_right_speed - last_right_speed;
+
+						if (fabsf(delta_l) > MAX_DELTA_SPEED)
+								target_left_speed = last_left_speed + MAX_DELTA_SPEED * ((delta_l > 0) ? 1 : -1);
+						if (fabsf(delta_r) > MAX_DELTA_SPEED)
+								target_right_speed = last_right_speed + MAX_DELTA_SPEED * ((delta_r > 0) ? 1 : -1);
+
+						float left_speed = SPEED_SMOOTHING * target_left_speed + (1 - SPEED_SMOOTHING) * last_left_speed;
+						float right_speed = SPEED_SMOOTHING * target_right_speed + (1 - SPEED_SMOOTHING) * last_right_speed;
+
+						last_left_speed = left_speed;
+						last_right_speed = right_speed;
+
+						set_left_pwm((int16_t)left_speed);
+						set_right_pwm((int16_t)right_speed);
+
+						printf("Target L: %.1f, R: %.1f | FilteredPitch: %.1f, Raw: %.1f\r\n",
+									 left_speed, right_speed, filtered_pitch, raw_pitch);
+				}
+				osDelay(1);
+		}
+
+
   
   /* USER CODE END StartDefaultTask */
 }
@@ -236,7 +264,9 @@ void StartTask02(void const * argument)
   /* USER CODE BEGIN StartTask02 */
   /* Infinite loop */
   for(;;)
-  {
+  {//
+		
+		//读取一个mpu6050的加速度x y加速度值
     osDelay(1);
   }
   /* USER CODE END StartTask02 */
@@ -273,7 +303,14 @@ void StartTask05(void const * argument)
   /* Infinite loop */
   for(;;)
   {  
-    osDelay(1);
+				uint32_t now = xTaskGetTickCount();
+        if ((now - last_frame_tick) > pdMS_TO_TICKS(1000)) // 超过1s未更新
+        {
+            set_left_pwm(0);
+            set_right_pwm(0);
+            reset_state(); // 重置状态
+        }
+        osDelay(1);
   }
   /* USER CODE END StartTask05 */
 }
